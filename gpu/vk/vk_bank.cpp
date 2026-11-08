@@ -34,6 +34,7 @@ std::vector<TexReg> tex_regs;
 std::vector<SampReg> samp_regs;
 std::unordered_map<uint64_t, std::vector<int>> regs_by_serial;
 std::atomic<uint64_t> reg_gen{1};   // (bumped by every texture registration: resolved handles go stale)
+std::atomic<uint64_t> samp_gen{1};  // (tk: bumped by every sampler registration: sampler_of's caches go stale)
 // (and a version a slot: caches of what a slot resolves to check theirs, not every registration's)
 constexpr int kSlotVersions = 1 << 20;
 std::unique_ptr<std::atomic<uint32_t>[]> slot_versions{new std::atomic<uint32_t>[kSlotVersions]()};
@@ -172,6 +173,7 @@ void register_sampler_copy(int id, const nvn_samp_par& par) {
     if ((size_t)id >= samp_regs.size()) samp_regs.resize((size_t)id + 256);
     samp_regs[id].p = *p;
     samp_regs[id].ok = true;
+    samp_gen.fetch_add(1, std::memory_order_acq_rel);
 }
 void texture_released(uint64_t serial) {
     std::lock_guard lk(reg_mu);
@@ -181,18 +183,50 @@ void texture_released(uint64_t serial) {
         if (id >= 0 && (size_t)id < tex_regs.size()) tex_regs[id].released = true, slot_versions[id].fetch_add(1);
     reg_gen++;
 }
+// (tk) The draw path looks textures and samplers up by slot several times a draw, each under reg_mu (2% of the replay thread in
+// mutex locks with the other locks of the draw path). Each thread keeps what it read, until a registration changes the table: textures
+// bump reg_gen (registered or released), samplers samp_gen
+namespace {
+struct TexCacheEntry { uint64_t gen = ~0ull; bool ok = false; nvn_tex t; nvn_view v; bool has_view = false; };
+struct SampCacheEntry { uint64_t gen = ~0ull; bool ok = false; nvn_samp_par p; };
+}
 bool texture_of(int id, nvn_tex* t, nvn_view* v, bool* has_view) {
+    if (id < 0) return false;
+    static thread_local std::vector<TexCacheEntry> cache;
+    const uint64_t gen = reg_gen.load(std::memory_order_acquire);
+    if ((size_t)id < cache.size() && cache[id].gen == gen) {
+        const TexCacheEntry& c = cache[id];
+        if (c.ok) *t = c.t, *v = c.v, *has_view = c.has_view;
+        return c.ok;
+    }
     std::lock_guard lk(reg_mu);
-    if (id < 0 || (size_t)id >= tex_regs.size() || !tex_regs[id].ok) return false;
+    const uint64_t gen_now = reg_gen.load(std::memory_order_acquire);   // (under the lock: what is read matches it)
+    if ((size_t)id >= cache.size()) cache.resize((size_t)id + 256);
+    TexCacheEntry& c = cache[id];
+    c.gen = gen_now;
+    c.ok = (size_t)id < tex_regs.size() && tex_regs[id].ok;
+    if (!c.ok) return false;
     const TexReg& r = tex_regs[id];
+    c.t = r.t, c.v = r.v, c.has_view = r.has_view;
     *t = r.t, *v = r.v, *has_view = r.has_view;
     return true;
 }
 bool sampler_of(int id, nvn_samp_par* p) {
+    if (id < 0) return false;
+    static thread_local std::vector<SampCacheEntry> cache;
+    const uint64_t gen = samp_gen.load(std::memory_order_acquire);
+    if ((size_t)id < cache.size() && cache[id].gen == gen) {
+        if (cache[id].ok) *p = cache[id].p;
+        return cache[id].ok;
+    }
     std::lock_guard lk(reg_mu);
-    if (id < 0 || (size_t)id >= samp_regs.size() || !samp_regs[id].ok) return false;
-    *p = samp_regs[id].p;
-    return true;
+    const uint64_t gen_now = samp_gen.load(std::memory_order_acquire);
+    if ((size_t)id >= cache.size()) cache.resize((size_t)id + 256);
+    SampCacheEntry& c = cache[id];
+    c.gen = gen_now;
+    c.ok = (size_t)id < samp_regs.size() && samp_regs[id].ok;
+    if (c.ok) c.p = samp_regs[id].p, *p = c.p;
+    return c.ok;
 }
 
 void driver_bank(const NvnState& s, int bank, int stage, uint8_t d[0xA00]) {
