@@ -235,7 +235,7 @@ static int game_in_front(void) {
    script's syntax, their times counted from when the line is read ("0:LUP/2000,2:A"): a test can steer the game
    by looking at its screenshots. */
 typedef struct { int64_t start_ms, end_ms; uint64_t buttons; int32_t stick[4]; } Press;
-#define MAX_PRESSES 1024
+#define MAX_PRESSES 16384   /* (tk: a recorded play-through, HOS_INPUT_RECORD, has a press per change) */
 static Press presses[MAX_PRESSES];
 static int npresses = -1;
 static int64_t script_t0, script_end_ms;
@@ -266,7 +266,24 @@ static void parse_script(void) {
         script_frame_clock = e && atoi(e) != 0;
         if (script_frame_clock) script_frame0 = InterlockedCompareExchange64(&hos_present_count, 0, 0);
     }
-    parse_presses(getenv("HOS_INPUT_SCRIPT"), 0, 0);
+    {   /* (tk) HOS_INPUT_SCRIPT=@<file>: the script read from that file (a recorded route is longer than an environment variable takes) */
+        const char *e = getenv("HOS_INPUT_SCRIPT");
+        char *text = NULL;
+        if (e && e[0] == '@') {
+            FILE *f = fopen(e + 1, "rb");
+            if (f) {
+                fseek(f, 0, SEEK_END);
+                const long n = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                text = n > 0 ? (char *)malloc((size_t)n + 1) : NULL;
+                if (text) text[fread(text, 1, (size_t)n, f)] = 0;
+                fclose(f);
+            }
+            if (!text) hos_log("hid: could not read the input script %s", e + 1);
+        }
+        parse_presses(text ? text : (e && e[0] == '@' ? NULL : e), 0, 0);
+        free(text);
+    }
     if (npresses)
         hos_log("hid: input script of %d presses (last at %.0f s; the player's devices count too)", npresses,
                 script_end_ms / 1000.0);
@@ -608,6 +625,48 @@ static int bound_down(int i, int mouse) {
     return 0;
 }
 
+/* (tk) HOS_INPUT_RECORD=<file>: what the game is given (the player's devices and any script, after the controls' mapping) written as
+   an HOS_INPUT_SCRIPT, one press a line, on the script's clock (HOS_INPUT_FRAME_CLOCK=1 for frames, which a replay keeps to): a
+   play-through becomes a route that test runs repeat. The sticks are kept as their direction (past half way: full), as scripts
+   give them */
+static void record_input(uint64_t buttons, const int32_t stick[4]) {
+    static FILE *out;
+    static int looked;
+    static uint64_t last_state = 0;
+    static int64_t since_ms = 0;
+    if (!looked) {
+        looked = 1;
+        const char *path = getenv("HOS_INPUT_RECORD");
+        if (path && *path) {
+            out = fopen(path, "w");
+            hos_log(out ? "hid: recording the input to %s (HOS_INPUT_RECORD)" : "hid: could not write %s (HOS_INPUT_RECORD)", path);
+        }
+    }
+    if (!out) return;
+    static const char *const bnames[16] = {"A", "B", "X", "Y", "LS", "RS", "L", "R", "ZL", "ZR", "PLUS", "MINUS", "LEFT", "UP",
+                                           "RIGHT", "DOWN"};
+    static const char *const snames[8] = {"LLEFT", "LRIGHT", "LDOWN", "LUP", "RLEFT", "RRIGHT", "RDOWN", "RUP"};
+    uint64_t state = buttons & 0xFFFF;   /* (bits 16..23: the sticks' directions, axis x2 + positive) */
+    for (int a = 0; a < 4; a++) {
+        if (stick[a] < -16384) state |= 1ull << (16 + a * 2);
+        else if (stick[a] > 16384) state |= 1ull << (16 + a * 2 + 1);
+    }
+    if (npresses < 0) parse_script();   /* (the script's clock starts with it) */
+    const int64_t now = script_elapsed_ms(hos_now_ns());
+    if (state == last_state) return;
+    if (last_state) {   /* the press that just ended */
+        fprintf(out, "%.3f:", since_ms / 1000.0);
+        int first = 1;
+        for (int b = 0; b < 16; b++)
+            if (last_state >> b & 1) fprintf(out, "%s%s", first ? "" : "+", bnames[b]), first = 0;
+        for (int k = 0; k < 8; k++)
+            if (last_state >> (16 + k) & 1) fprintf(out, "%s%s", first ? "" : "+", snames[k]), first = 0;
+        fprintf(out, "/%lld,\n", (long long)(now - since_ms > 0 ? now - since_ms : 1));
+        fflush(out);
+    }
+    last_state = state, since_ms = now;
+}
+
 static void read_input(uint64_t *buttons, int32_t stick[4]) {
     *buttons = 0;
     memset(stick, 0, 4 * sizeof *stick);
@@ -714,6 +773,7 @@ static void npad_states(Ctx *c) {
         }
     }
     if (connected) read_input(&buttons, stick);
+    if (connected) record_input(buttons, stick);
     uint64_t hos_title_input(uint64_t buttons);   /* totk_title.c: the title menu's credits entries */
     if (connected) buttons = hos_title_input(buttons);
     uint64_t hos_frame_step_buttons(uint64_t buttons);   /* nn_vi.c: the frame step of the wheel and quick menus */
