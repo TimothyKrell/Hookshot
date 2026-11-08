@@ -55,7 +55,7 @@ if [ -f "$WORK/sa/build/hookshot_vk.so" ] && nm -D --undefined-only "$WORK/sa/bu
 fi
 
 if [ $install = 1 ]; then
-    for f in hookshot hookshot_vk.so; do
+    for f in hookshot hookshot_vk.so libSDL2-2.0.so.0 libSDL3.so.0; do
         [ -f "$WORK/sa/build/$f" ] || continue
         rm -f "$GAME/$f"   # (not over a running copy's file)
         cp -p "$WORK/sa/build/$f" "$GAME/$f"
