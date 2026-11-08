@@ -112,6 +112,14 @@ int hos_cores(void) {
         const char *e = getenv("HOS_CORES");
         n = e && atoi(e) >= 1 && atoi(e) <= 8 ? atoi(e) : 6;   /* (mkw-recomp: a Switch 2 application's six) */
         if (!e && hos_game_cores()) n = hos_game_cores();   /* (totk_cores.c: the game set up for more cores) */
+        /* (hookshot) a PC with 16 threads or more runs the game's threads on eight virtual cores: measured on a Ryzen 9 7950X in
+           the Deku Tree scene and Kokiri, 50.5 fps (low 42) with six, 59.7 (low 58.8) with eight. Six stays for smaller CPUs,
+           where the replay and the captures need the rest */
+        if (!e && !hos_game_cores()) {
+            SYSTEM_INFO si;
+            GetSystemInfo(&si);
+            if (si.dwNumberOfProcessors >= 16) n = 8;
+        }
     }
     return n;
 }

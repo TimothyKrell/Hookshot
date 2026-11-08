@@ -60,6 +60,15 @@ def target():
     return toolchain.native_target() + (["--sysroot=" + SYSROOT] if LINUX and SYSROOT else [])
 
 
+def vk_target():
+    """target() for the Vulkan back end. HOOKSHOT_VK_SYSTEM=1: the system's own headers and C++ library, not the sysroot's (the
+    AppImage's sysroot has no libstdc++ headers, since the AppImage ships the back end built; a development build compiles it
+    for the PC it runs on, the game's cached objects keeping the sysroot)"""
+    if LINUX and os.environ.get("HOOKSHOT_VK_SYSTEM") == "1":
+        return toolchain.native_target()
+    return target()
+
+
 def no_throttle(handle=None):
     """(issue 87) Windows' power throttling (EcoQoS) slows a background window's processes to almost nothing on some machines: the
     build sat at 0% CPU. Turned off for this process, or the one whose handle this is"""
@@ -457,7 +466,7 @@ def main():
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
-        vflags = target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
+        vflags = vk_target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",
@@ -486,7 +495,7 @@ def main():
                             vflags + ([stamp_def] if os.path.basename(src) == "vk_menu.cpp" else []),
                             vk_lib_deps if lib else vdeps))
         if LINUX:   # (its own copy of the Win32 calls on POSIX, and the bit of GDI the Insert menu draws text with)
-            cflags = target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
+            cflags = vk_target() + CPU + ["-fPIC", "-O2", "-g0", "-Wno-everything", "-D_GNU_SOURCE", "-I" + POSIX,
                                        "-I" + os.path.join(kit.HERE, "..", "third_party", "stb")]
             pdeps = tree_headers(POSIX)
             for f in ("win32_posix.c", "gdi_posix.c"):
@@ -583,7 +592,7 @@ def main():
         open(vrsp, "w", encoding="utf-8").write("\n".join('"%s"' % j[2].replace("\\", "/") for j in vk_jobs))
         t = time.time()
         if LINUX:   # (its C++ runtime inside: the game folder runs where the AppImage's sysroot is older than the system)
-            link = [toolchain.need(toolchain.find("clang++"))] + target() + [
+            link = [toolchain.need(toolchain.find("clang++"))] + vk_target() + [
                 "-fuse-ld=lld", "-shared", "-o", vdll, "-Wl,-Map=" + vdll + ".map", "-Wl,-Bsymbolic", "-Wl,--gc-sections",
                 "-static-libstdc++", "-static-libgcc", "@" + vrsp, "-ldl", "-lpthread", "-lm"]
         else:

@@ -47,6 +47,8 @@ static struct {
     uint32_t (*GetMouseState)(int *, int *);
     int (*SetRelativeMouseMode)(int);
     int (*GetDesktopDisplayMode)(int, SdlDisplayMode *);
+    int (*GetNumVideoDisplays)(void);
+    const char *(*GetDisplayName)(int);
     int (*Vulkan_CreateSurface)(void *, void *, void *);
     void (*Vulkan_GetDrawableSize)(void *, int *, int *);
     void (*SetWindowTitle)(void *, const char *);
@@ -80,6 +82,8 @@ static int load_sdl(void) {
     GET(GetMouseState, "SDL_GetMouseState");
     GET(SetRelativeMouseMode, "SDL_SetRelativeMouseMode");
     GET(GetDesktopDisplayMode, "SDL_GetDesktopDisplayMode");
+    GET(GetNumVideoDisplays, "SDL_GetNumVideoDisplays");
+    GET(GetDisplayName, "SDL_GetDisplayName");
     GET(Vulkan_CreateSurface, "SDL_Vulkan_CreateSurface");
     GET(Vulkan_GetDrawableSize, "SDL_Vulkan_GetDrawableSize");
     GET(SetWindowTitle, "SDL_SetWindowTitle");
@@ -175,6 +179,46 @@ __attribute__((visibility("default"))) void hos_posix_post_message(uint32_t msg,
     if (msg == WM_APP + 7) __atomic_store_n(&fullscreen_asked, wp ? 1 : 0, __ATOMIC_RELEASE);
 }
 static int sdl_ready;
+static int display;   /* (SDL's index of the monitor the game opens on) */
+
+/* The monitor the game opens on and takes its shape from (the Insert menu's Ultrawide reads it): HOS_DISPLAY=<index or part of
+   its name>, else the one with the most pixels (a desk's main monitor; SDL's display 0 is whichever output the compositor
+   listed first: a 1080p drawing tablet here, and the Ultrawide row read 16:9 beside a 32:9 monitor) */
+/* the Insert menu's Fullscreen row as saved (hookshot_options.ini beside the game): the window starts that way */
+static int fullscreen_from_ini(void) {
+    char path[PATH_MAX];
+    DWORD n = GetModuleFileNameA(NULL, path, sizeof path);
+    while (n && path[n - 1] != '/') n--;
+    snprintf(path + n, sizeof path - n, "hookshot_options.ini");
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char line[80];
+    int on = 0;
+    while (fgets(line, sizeof line, f))
+        if (!strncmp(line, "fullscreen=", 11)) on = atoi(line + 11) != 0;
+    fclose(f);
+    return on;
+}
+static int pick_display(void) {
+    const int n = sdl.GetNumVideoDisplays();
+    const char *want = getenv("HOS_DISPLAY");
+    int best = 0;
+    long long best_px = -1;
+    for (int i = 0; i < n; i++) {
+        SdlDisplayMode m;
+        const char *name = sdl.GetDisplayName(i);
+        if (sdl.GetDesktopDisplayMode(i, &m)) continue;
+        hos_log("display: %d: %s, %dx%d at %d Hz", i, name ? name : "?", m.w, m.h, m.refresh_rate);
+        if (want && *want) {
+            char *end;
+            const long k = strtol(want, &end, 10);
+            if ((!*end && k == i) || (*end && name && strstr(name, want))) { best = i, best_px = LLONG_MAX; continue; }
+        }
+        if (best_px != LLONG_MAX && (long long)m.w * m.h > best_px) best = i, best_px = (long long)m.w * m.h;
+    }
+    if (n > 1) hos_log("display: the game opens on display %d%s", best, want ? " (HOS_DISPLAY)" : " (the most pixels)");
+    return best;
+}
 int hos_display_owns_sdl(void) { return sdl_ready; }   /* (controllers stay on this thread while it runs SDL) */
 
 /* main(), before the game: SDL's video on this, the main, thread; the screen's size for GetSystemMetrics */
@@ -183,12 +227,16 @@ int hos_display_init(void) {
     if (!load_sdl()) return 0;
     sdl.SetHint("SDL_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR", "0");
     sdl.SetHint("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1");
+    /* (a Wayland session gets a Wayland window, not XWayland's: fullscreen on the output asked for, and the compositor's own
+       pacing. SDL2 picks X11 first unless told; SDL_VIDEODRIVER still chooses) */
+    if (getenv("WAYLAND_DISPLAY") && !getenv("SDL_VIDEODRIVER")) sdl.SetHint("SDL_VIDEODRIVER", "wayland,x11");
     if (sdl.Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS)) {
         hos_log("display: SDL_Init: %s: no window", sdl.GetError());
         return 0;
     }
+    display = pick_display();
     SdlDisplayMode m;
-    if (!sdl.GetDesktopDisplayMode(0, &m)) hos_posix_window[1] = m.w, hos_posix_window[2] = m.h;
+    if (!sdl.GetDesktopDisplayMode(display, &m)) hos_posix_window[1] = m.w, hos_posix_window[2] = m.h;
     sdl_ready = 1;
     return 1;
 }
@@ -216,8 +264,12 @@ void hos_display_loop(void) {
         int w = 0, h = 0;
         if (sscanf(getenv("HOS_WINDOW_SIZE"), "%dx%d", &w, &h) == 2 && w >= 64 && h >= 64) win_w = w, win_h = h;
     }
-    window = sdl.CreateWindow(HOS_GAME_TITLE, 0x2FFF0000 /* centred */, 0x2FFF0000, win_w, win_h,
-                              WIN_SHOWN | WIN_RESIZABLE | WIN_HIGHDPI | WIN_VULKAN);
+    /* (centred on the chosen display; fullscreen asked at creation, so SDL asks the compositor for that output rather than
+       the one with the focus) */
+    const int full_now = getenv("HOS_FULLSCREEN") ? atoi(getenv("HOS_FULLSCREEN")) != 0 : fullscreen_from_ini();
+    window = sdl.CreateWindow(HOS_GAME_TITLE, 0x2FFF0000 | display /* centred there */, 0x2FFF0000 | display, win_w, win_h,
+                              WIN_SHOWN | WIN_RESIZABLE | WIN_HIGHDPI | WIN_VULKAN | (full_now ? WIN_FULLSCREEN_DESKTOP : 0));
+    if (window && full_now) fullscreen = 1, hos_posix_window[3] = 1, hos_log("display: fullscreen (F11 for a window)");
     if (!window) {
         hos_log("display: SDL_CreateWindow: %s: no window", sdl.GetError());
         rx_start(NULL);
@@ -226,7 +278,6 @@ void hos_display_loop(void) {
     }
     vk_window.window = window;
     hos_posix_window[0] = 1;
-    if (getenv("HOS_FULLSCREEN") && atoi(getenv("HOS_FULLSCREEN"))) set_fullscreen(1);
     CloseHandle(CreateThread(NULL, 0, renderer_main, NULL, 0, NULL));
     for (;;) {
         hos_sdl_pads_pump();

@@ -495,10 +495,42 @@ static DWORD WINAPI game_thread(void *p) {
     (void)p;
     ExitProcess((UINT)game_main(game_argc, game_argv));
 }
+/* (hookshot) A CPU of several core complexes (Ryzen 9: two CCDs, each with its own L3) keeps the whole game on the first one: its
+   threads hand work to each other every frame, and a hand-off across CCDs goes through the I/O die. Measured on a 7950X: low
+   58.8 fps spread over both, 59.8 on one, with fewer late frames. HOS_ALL_CCDS=1 leaves the affinity alone; so does an affinity
+   chosen already (taskset), and a complex of fewer than 12 threads */
+static void keep_to_one_ccd(void) {
+    if (getenv("HOS_ALL_CCDS") && atoi(getenv("HOS_ALL_CCDS"))) return;
+    cpu_set_t now;
+    if (sched_getaffinity(0, sizeof now, &now) || CPU_COUNT(&now) != (int)sysconf(_SC_NPROCESSORS_ONLN)) return;
+    FILE *f = fopen("/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list", "r");
+    if (!f) return;
+    char list[256] = {0};
+    const int got = fgets(list, sizeof list, f) != NULL;
+    fclose(f);
+    if (!got) return;
+    cpu_set_t ccd;
+    CPU_ZERO(&ccd);
+    for (char *p = list; *p && *p != '\n';) {
+        char *end;
+        long a = strtol(p, &end, 10), b = a;
+        if (end == p) break;
+        if (*end == '-') b = strtol(end + 1, &end, 10);
+        for (long c = a; c <= b && c < CPU_SETSIZE; c++) CPU_SET((int)c, &ccd);
+        p = *end == ',' ? end + 1 : end;
+    }
+    const int n = CPU_COUNT(&ccd);
+    if (n < 12 || n >= CPU_COUNT(&now)) return;
+    if (!sched_setaffinity(0, sizeof ccd, &ccd))
+        fprintf(stderr, "[hos host] cpu: the game kept to the first core complex (%d of %d threads: %s); HOS_ALL_CCDS=1 for all\n", n,
+                CPU_COUNT(&now), strtok(list, "\n"));
+}
+
 int main(int argc, char **argv) {
     int hos_display_init(void);
     void hos_display_loop(void);
     load_hookshot_env();
+    keep_to_one_ccd();
     game_argc = argc, game_argv = argv;
     const int window = hos_display_init();
     HANDLE t = CreateThread(NULL, 64u << 20, game_thread, NULL, 0, NULL);
