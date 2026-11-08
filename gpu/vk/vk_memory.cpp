@@ -1582,8 +1582,16 @@ void mirror_sync(Pool& p) {
                 auto b = cap_bufs.find(e.gen);
                 if (b != cap_bufs.end()) {
                     const uint64_t ga = std::max(page << kPageShift, p.lo), gb = std::min((page + 1) << kPageShift, p.hi);
-                    cap_runs[b->second.buffer].push_back(
-                        {(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga});
+                    {   // (tk) a page after the last one in both the capture and the mirror: the same copy, longer (3,500 regions
+                        // of 4 KB a frame in Link's house, each its own step for the copy engine)
+                        auto& rs = cap_runs[b->second.buffer];
+                        const VkBufferCopy c{(uint64_t)e.slot * 4096 + (ga - (page << kPageShift)), ga - p.lo, gb - ga};
+                        if (!rs.empty() && rs.back().srcOffset + rs.back().size == c.srcOffset &&
+                            rs.back().dstOffset + rs.back().size == c.dstOffset)
+                            rs.back().size += c.size;
+                        else
+                            rs.push_back(c);
+                    }
                     b->second.last_use = std::max(b->second.last_use, cur_cap_value);
                     (e.gen == cur_cap_gen ? st_sync_cap_pages : st_sync_old_pages)++;
                     page++;
