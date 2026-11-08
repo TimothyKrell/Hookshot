@@ -1610,12 +1610,23 @@ std::vector<WriteBack> writebacks;
 std::mutex cpu_words_mu;
 std::set<uint64_t> cpu_words;
 } // namespace
+std::atomic<uint32_t> cpu_words_gen{0};   // (tk) bumped when cpu_words is cleared: the callers' caches of what is in it go
 void memory_cpu_owned(uint64_t guest, uint64_t size) {
     static const bool off = getenv("RX_VK_WB_REPORTS") != nullptr;
     if (off || !guest) return;
+    // (tk) the same report words come every frame (thousands of reports a frame outdoors): words this thread put in since the last
+    // clear are skipped without the lock and the tree, which made this the replay thread's second-hottest function
+    static thread_local std::unordered_set<uint64_t> known;
+    static thread_local uint32_t known_gen = ~0u;
+    const uint32_t gen = cpu_words_gen.load(std::memory_order_acquire);
+    if (gen != known_gen) known.clear(), known_gen = gen;
+    bool all = true;
+    for (uint64_t a = guest & ~7ull; a < guest + size && all; a += 8) all = known.count(a) != 0;
+    if (all) return;
     std::lock_guard lk(cpu_words_mu);
-    if (cpu_words.size() > 65536) cpu_words.clear();
-    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words.insert(a);
+    if (cpu_words.size() > 65536) cpu_words.clear(), cpu_words_gen.fetch_add(1, std::memory_order_release), known.clear();
+    for (uint64_t a = guest & ~7ull; a < guest + size; a += 8) cpu_words.insert(a), known.insert(a);
+    known_gen = cpu_words_gen.load(std::memory_order_relaxed);
 }
 namespace {
 // (a write-back's runs with the replay's own words cut out of them: runs of p, offsets in the pool)
