@@ -2301,8 +2301,42 @@ struct DynFast {
     uint8_t raw[160]{};
     int nb = 0;
     uint32_t wm0 = 0, wm_n = 0;
+    bool hud = false;
 };
 thread_local DynFast dyn_fast;
+
+// ---- (tk) The HUD at its own shape on a screen wider than 16:9. The game draws its HUD into the 16:9 scene target (2048x1152 here)
+// that its last pass scales into the window texture, and the whole picture is stretched to the window; with the camera widened
+// (HOS_ASPECT, the Ultrawide row) the 3D keeps its proportions, the HUD did not (hearts and buttons twice as wide at 32:9). Its
+// draws are squeezed toward the centre by 16:9 over the window's shape, so they come out square and in a 16:9 area in the middle.
+// Which target: the one the pass into a presented window texture samples. Which draws: those into it that sample no rendered
+// texture half its size or more (the composite and the post-processing sample the whole scene; the HUD samples atlases).
+// RX_VK_HUD_SQUEEZE=0: as before; =<factor>: that squeeze ----
+std::atomic<uint64_t> hud_windows[4];
+std::atomic<uint64_t> hud_target{0};
+float hud_factor() {
+    static float k = -1;
+    if (k < 0) {
+        k = 1.0f;
+        const float aspect = host && host->aspect_ratio ? host->aspect_ratio() : 0.0f;
+        if (aspect > 1.8f) k = (16.0f / 9.0f) / aspect;
+        if (const char* e = getenv("RX_VK_HUD_SQUEEZE")) k = atof(e) > 0.0f && atof(e) <= 1.0f ? (float)atof(e) : 1.0f;
+        if (k < 1.0f) logf("vk: the HUD squeezed by %.3f toward the centre (the window is wider than 16:9; RX_VK_HUD_SQUEEZE=0: off)", k);
+    }
+    return k;
+}
+void hud_note_present_in(uint64_t gpu) {
+    if (!gpu) return;
+    for (auto& w : hud_windows)
+        if (w.load(std::memory_order_relaxed) == gpu) return;
+    static std::atomic<uint32_t> next{0};
+    hud_windows[next++ % 4].store(gpu, std::memory_order_relaxed);
+}
+bool hud_is_window(uint64_t gpu) {
+    for (auto& w : hud_windows)
+        if (w.load(std::memory_order_relaxed) == gpu) return true;
+    return false;
+}
 int dyn_pack(const NvnState& s, const Targets& at, VkPrimitiveTopology topo, bool mesh, float* fp, uint32_t* up,
              uint8_t* raw) {
     fp[0] = s.viewport[0][0], fp[1] = s.viewport[0][1], fp[2] = s.viewport[0][2], fp[3] = s.viewport[0][3];
@@ -2336,7 +2370,13 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     uint32_t du[kDynU];
     uint8_t db[160];
     const int nb = dyn_pack(s, at, topo, mesh, df, du, db);
-    if (!dump_on() && last_dyn_valid && dyn_fast.on && dyn_fast.nb == nb &&
+    bool hud = false;
+    if (hud_factor() < 1.0f && at.n && at.color[0] && at.color[0]->gpu == hud_target.load(std::memory_order_relaxed)) {
+        hud = true;
+        for (const Texture* t : gfx_sampled)
+            if (t && t->width * 2 >= at.width && t->height * 2 >= at.height) hud = false;
+    }
+    if (!dump_on() && last_dyn_valid && dyn_fast.on && dyn_fast.nb == nb && dyn_fast.hud == hud &&
         dyn_same(df, kDynF, du, kDynU, db, nb, dyn_fast.fp, dyn_fast.up, dyn_fast.raw)) {
         pass.wm_or |= dyn_fast.wm0, pass.wm_n = dyn_fast.wm_n;   // (the pass trace still sees the masks)
         return;
@@ -2368,6 +2408,12 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
         const int32_t x1 = std::min<int32_t>(s.scissor[0] + s.scissor[2], (int32_t)at.width);
         const int32_t y1 = std::min<int32_t>(s.scissor[1] + s.scissor[3], (int32_t)at.height);
         d.sc = {{x0, y0}, {(uint32_t)std::max(0, x1 - x0), (uint32_t)std::max(0, y1 - y0)}};
+    }
+    if (hud) {   // (the HUD's draws toward the centre: x and width only, the scissor with them)
+        const float k = hud_factor(), cx = (float)at.width * 0.5f;
+        d.vp.x = cx + (d.vp.x - cx) * k, d.vp.width *= k;
+        const float x0 = cx + ((float)d.sc.offset.x - cx) * k, w = (float)d.sc.extent.width * k;
+        d.sc.offset.x = std::max(0, (int32_t)x0), d.sc.extent.width = (uint32_t)(w + 2.0f);
     }
     std::memcpy(d.blend, s.blend_color, sizeof d.blend);
     for (int f = 0; f < 2; f++)
@@ -2482,7 +2528,7 @@ void dynamic_state(VkCommandBuffer cmd, const NvnState& s, const Targets& at, Vk
     }
     last_dyn = d;
     last_dyn_valid = true;
-    dyn_fast.on = true, dyn_fast.nb = nb;
+    dyn_fast.on = true, dyn_fast.nb = nb, dyn_fast.hud = hud;
     std::memcpy(dyn_fast.fp, df, sizeof df);
     std::memcpy(dyn_fast.up, du, sizeof du);
     std::memcpy(dyn_fast.raw, db, (size_t)nb);
@@ -4065,6 +4111,8 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PROF(PROF_CMDS);
     texture_watch_prog(p.key);
     if (!same_desc) gfx_sampled = draw_sampled;
+    if (at.n && at.color[0] && gfx_sampled.size() == 1 && gfx_sampled[0] && hud_factor() < 1.0f && hud_is_window(at.color[0]->gpu))
+        hud_target.store(gfx_sampled[0]->gpu, std::memory_order_relaxed);   // (the last pass's source: where the HUD is drawn)
     static const bool barrier_every = getenv("RX_VK_BARRIER_EVERY_DRAW") != nullptr;   // (an experiment: a pass each)
     if (barrier_every) end_pass(cmd);
     const uint16_t writes = draw_hazards(cmd, p, s, at);
@@ -5314,5 +5362,8 @@ void pipeline_cache_save(bool force) {
     if (force) save();
     else std::thread(save).detach();
 }
+
+// (tk) the window textures presented (vk_replay.cpp do_present): the HUD's target is found from the pass into them
+void hud_note_present(uint64_t gpu) { hud_note_present_in(gpu); }
 
 } // namespace mkwvk

@@ -2285,6 +2285,7 @@ void do_present(const nvn_tex* t, const int crop[4]) {
         Recording& r = begin_recording(value);
         memory_begin_submission();
         Texture* tex = t ? texture_for_present(t) : nullptr;
+        if (t) hud_note_present(t->gpu);
         static int logged_p;
         if (logged_p++ < 4)
             logf("vk: present texture %#llx %ux%u format %#x: %s", (unsigned long long)(t ? t->gpu : 0),
