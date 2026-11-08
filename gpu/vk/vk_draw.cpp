@@ -1249,6 +1249,25 @@ bool trace_tex_wanted(const Texture* t) {
     return !want.empty() && trace_tex_mask == (1u << want.size()) - 1;   // (a draw with all of them)
 }
 thread_local VkFormat last_view_format = VK_FORMAT_UNDEFINED;   // (hookshot: RX_VK_LOG_IMG, the view last made)
+// ---- (tk) Copy on feedback. A draw that samples a colour target it also writes (OoT: f8c237d19f90b5fb, 1536x864, reads its own
+// target and the depth) is a feedback loop: NVN gives it the target as it was before the draw, Vulkan leaves it undefined. Before such
+// a draw the target is copied into a scratch image and the draw samples the copy. The probes put the first difference of a dark
+// one-frame flash at that pass. RX_VK_FEEDBACK_COPY=0: as before ----
+struct Feedback {
+    const Targets* at = nullptr;
+    uint16_t writes = 0;
+    Texture* hit = nullptr;        // (the first sampled texture that is a written target)
+    Texture* subst_for = nullptr;  // (sampled as the copy)
+    VkImageView subst_view = VK_NULL_HANDLE;
+    VkFormat hit_format = VK_FORMAT_UNDEFINED;
+};
+thread_local Feedback fb;
+thread_local bool feedback_used = false;   // (this draw's descriptors sample a copy: the next draw builds its own)
+int64_t st_feedback_copies = 0;
+bool feedback_copy_on() {
+    static const bool on = !getenv("RX_VK_FEEDBACK_COPY") || atoi(getenv("RX_VK_FEEDBACK_COPY")) != 0;
+    return on;
+}
 bool log_img_wanted(uint64_t key) {   // (hookshot) RX_VK_LOG_IMG=<key prefix,...>: its texture and image bindings, 8 times
     static const char* want = getenv("RX_VK_LOG_IMG");
     if (!want) return false;
@@ -1822,6 +1841,14 @@ void build_descriptors(const NvnState& s, const Program& p) {
                 Texture* tex = nullptr;
                 VkImageView view = handle ? texture_view_of(handle, vt, ViewUse::Sample, VK_FORMAT_UNDEFINED, &tex)
                                           : VK_NULL_HANDLE;
+                if (fb.at && view && tex)   // (tk) copy on feedback: a target this draw writes, sampled
+                    for (int i = 0; i < fb.at->n; i++)
+                        if ((fb.writes >> i & 1) && fb.at->color[i] == tex && tex->levels == 1 && tex->layers == 1) {   // (a mip chain's
+                            // levels drawn from the one above are other memory: not a loop)
+                            if (fb.subst_for == tex && fb.subst_view) view = fb.subst_view, tex = nullptr;
+                            else if (!fb.hit) fb.hit = tex, fb.hit_format = last_view_format;
+                            break;
+                        }
                 if (dump_on()) dump_input('t', (uint32_t)(dw.imgs.size() - 0), handle, view ? tex : nullptr);
                 if (view && tex && trace_tex_wanted(tex)) trace_tex_hit = tex;
                 if (log_img_wanted(p.key)) {
@@ -3934,6 +3961,60 @@ struct KeptVertex {
 };
 thread_local KeptVertex kept_vb[16];
 
+namespace {
+// (tk) the scratch copies for copy on feedback: one image per format and size, a view per view format
+struct Scratch { Texture tex; std::unordered_map<int, VkImageView> views; };
+std::map<std::tuple<int, uint32_t, uint32_t>, Scratch> scratches;
+/// The view of a fresh copy of target slot i's level (recorded into cmd, out of any pass), or null
+VkImageView feedback_copy(VkCommandBuffer cmd, const Targets& at, int i, VkFormat view_format) {
+    Texture* t = at.color[i];
+    if (!t || !t->image || t->samples != VK_SAMPLE_COUNT_1_BIT || t->type != VK_IMAGE_TYPE_2D) return VK_NULL_HANDLE;
+    const uint32_t lv = at.color_level[i], w = std::max(1u, t->width >> lv), h = std::max(1u, t->height >> lv);
+    Scratch& sc = scratches[{(int)t->format, w, h}];
+    if (!sc.tex.image) {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        ci.imageType = VK_IMAGE_TYPE_2D;
+        ci.format = t->format;
+        ci.extent = {w, h, 1};
+        ci.mipLevels = 1, ci.arrayLayers = 1, ci.samples = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        if (!create_image(ci, sc.tex.image, sc.tex.allocation)) { sc.tex.image = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+        sc.tex.format = t->format, sc.tex.usage = ci.usage, sc.tex.width = w, sc.tex.height = h;
+        VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+        b.srcStageMask = b.dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        b.dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = sc.tex.image;
+        b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+        di.imageMemoryBarrierCount = 1, di.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cmd, &di);
+        logf("vk: copy on feedback: a scratch %ux%u format %d (a draw samples a target it writes)", w, h, (int)t->format);
+    }
+    const VkFormat vf = view_format != VK_FORMAT_UNDEFINED ? view_format : t->format;
+    VkImageView& v = sc.views[(int)vf];
+    if (!v) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = sc.tex.image, vi.viewType = VK_IMAGE_VIEW_TYPE_2D, vi.format = vf;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        if (vkCreateImageView(dev.device, &vi, nullptr, &v) != VK_SUCCESS) v = VK_NULL_HANDLE;
+    }
+    if (!v) return VK_NULL_HANDLE;
+    full_barrier(cmd);
+    VkImageCopy c{};
+    c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, at.color_layer[i], 1};
+    c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.extent = {w, h, 1};
+    vkCmdCopyImage(cmd, t->image, VK_IMAGE_LAYOUT_GENERAL, sc.tex.image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    full_barrier(cmd);
+    return v;
+}
+} // namespace
+
 void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     PROF(PROF_DRAW);
     stats_tick();
@@ -4092,7 +4173,27 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (!same_desc) {
         PROF(PROF_DESC);
         trace_tex_hit = nullptr, trace_tex_mask = 0;
+        fb = Feedback{};
+        if (feedback_copy_on()) {
+            fb.at = &at;
+            for (int i = 0; i < at.n; i++)
+                if (at.color[i] && target_write_mask(p, s, i)) fb.writes |= (uint16_t)(1u << i);
+        }
         build_descriptors(s, p);   // (textures first used here are uploaded by the recording's upload command buffer)
+        if (fb.hit) {   // (tk) copy on feedback: the target copied out of the pass, the descriptors built again with the copy
+            int slot = -1;
+            for (int i = 0; i < at.n; i++)
+                if (at.color[i] == fb.hit) slot = i;
+            end_pass(cmd);
+            const VkImageView v = slot >= 0 ? feedback_copy(cmd, at, slot, fb.hit_format) : VK_NULL_HANDLE;
+            if (v) {
+                fb.subst_for = fb.hit, fb.subst_view = v, fb.hit = nullptr;
+                build_descriptors(s, p);
+                st_feedback_copies++;
+                feedback_used = true;
+            }
+        }
+        fb.at = nullptr;
         static std::string last_logged;
         if (dump_on()) {
             char head[256];
@@ -4168,6 +4269,7 @@ void draw(VkCommandBuffer cmd, NvnState& s, const DrawArgs& d) {
     if (!same_desc) {
         if (!bind_descriptors(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, p)) SKIP_HERE();
         last_desc_valid = true, last_desc_prog = &p, last_desc_bind = s.bind_gen, last_desc_reg = reg_gen;
+        if (feedback_used) last_desc_valid = false, feedback_used = false;   // (tk) not reused: the copy is this draw's
         last_desc_ub = ub_gen;
     } else {
         st_desc_reused++;
