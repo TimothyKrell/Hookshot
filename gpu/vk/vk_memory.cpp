@@ -69,11 +69,21 @@ Pool* last_pool = nullptr;            // (the last pool_of hit: draws in a row b
 extern Pool* pool_cache[4096];
 void retire_pool(std::map<uint64_t, Pool>::iterator it);
 Pool* pool_lookup(uint64_t guest, uint64_t size);
+#ifdef _WIN32
 struct SrwMutex {   // (a slim reader/writer lock: half std::mutex's cost, taken for every buffer a draw binds)
     SRWLOCK l = SRWLOCK_INIT;
     void lock() { AcquireSRWLockExclusive(&l); }
     void unlock() { ReleaseSRWLockExclusive(&l); }
 };
+#else
+// (tk, linux) host/posix makes an SRWLOCK a pthread_rwlock, heavier than a futex mutex for a lock only ever taken exclusively
+// (its lock and unlock were ~1% of the replay thread): a plain mutex here
+struct SrwMutex {
+    std::mutex m;
+    void lock() { m.lock(); }
+    void unlock() { m.unlock(); }
+};
+#endif
 SrwMutex pools_mu;
 uint32_t generation = ~0u;
 uint64_t align = 4096;
