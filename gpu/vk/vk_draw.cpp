@@ -2390,18 +2390,20 @@ thread_local DynFast dyn_fast;
 // that its last pass scales into the window texture, and the whole picture is stretched to the window; with the camera widened
 // (HOS_ASPECT, the Ultrawide row) the 3D keeps its proportions, the HUD did not (hearts and buttons twice as wide at 32:9). Its
 // draws are squeezed toward the centre by 16:9 over the window's shape, so they come out square and in a 16:9 area in the middle.
+// Off now: the game's own widescreen (nx2/oot_wide.py) renders at the window's shape and places the HUD itself. RX_VK_HUD_SQUEEZE=1: the
+// squeeze from the window's shape (for a build without it), =<factor>: that one.
 // Which target: the one the pass into a presented window texture samples. Which draws: those into it that sample no rendered
-// texture half its size or more (the composite and the post-processing sample the whole scene; the HUD samples atlases).
-// RX_VK_HUD_SQUEEZE=0: as before; =<factor>: that squeeze ----
+// texture half its size or more (the composite and the post-processing sample the whole scene; the HUD samples atlases). ----
 std::atomic<uint64_t> hud_windows[4];
 std::atomic<uint64_t> hud_target{0};
 float hud_factor() {
     static float k = -1;
     if (k < 0) {
-        k = 1.0f;
-        const float aspect = host && host->aspect_ratio ? host->aspect_ratio() : 0.0f;
-        if (aspect > 1.8f) k = (16.0f / 9.0f) / aspect;
-        if (const char* e = getenv("RX_VK_HUD_SQUEEZE")) k = atof(e) > 0.0f && atof(e) <= 1.0f ? (float)atof(e) : 1.0f;
+        k = 1.0f;   // (off by default since upstream's widescreen (nx2/oot_wide.py) places the HUD in the middle 16:9 in the game itself)
+        if (const char* e = getenv("RX_VK_HUD_SQUEEZE")) {
+            const float aspect = host && host->aspect_ratio ? host->aspect_ratio() : 0.0f;
+            k = atof(e) > 0.0f && atof(e) <= 1.0f ? (float)atof(e) : aspect > 1.8f ? (16.0f / 9.0f) / aspect : 1.0f;
+        }
         if (k < 1.0f) logf("vk: the HUD squeezed by %.3f toward the centre (the window is wider than 16:9; RX_VK_HUD_SQUEEZE=0: off)", k);
     }
     return k;

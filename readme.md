@@ -43,10 +43,14 @@ Upstream Hookshot plus changes aimed at Linux, ultrawide monitors and frame rate
 | Change | Effect |
 |---|---|
 | Write back only the GPU results the CPU reads (`RX_VK_WB_LEARN=0`: off) | 67 -> 14 MB a frame across PCIe, GPU 8.4 -> 5.3 ms, 45 -> 51 fps |
+| Copy on feedback: a draw that samples a target it writes samples a copy (`RX_VK_FEEDBACK_COPY=0`: off) | dark one-frame flashes halved before the per-queue fences; none now |
 | `scripts/check_romfs.py --fix`: stand-ins for textures a bad dump left unreadable | a load retried 11 times a second stops; 51 -> 54 fps |
-| The HUD at its own shape on ultrawide, in a centred 16:9 area (`RX_VK_HUD_SQUEEZE=0`: off) | hearts and prompts no longer stretched 2x at 32:9 |
-| Linux: the game opens on the monitor with the most pixels (`HOS_DISPLAY=<index or name>`), fullscreen there, Wayland first | the Ultrawide row works on Linux (it read display 0, a 1080p tablet here) |
+| A CPU read of GPU results gives its virtual core up while it waits | slightly better lows |
+| Linux: the game opens on the monitor with the most pixels (`HOS_DISPLAY=<index or name>`), fullscreen there, Wayland first | the widescreen picture takes the right monitor's shape on Linux |
 | 8 virtual cores on CPUs with 16+ threads; one CCD on multi-CCD Ryzens (`HOS_ALL_CCDS=1`: off) | Deku Tree scene: 50 -> 60 fps |
+
+With upstream's own widescreen (the picture rendered at the window's shape, the HUD in the middle 16:9) and per-queue fences
+merged: Link's house at 5120x1440, windowed, 59.3 fps average (10th percentile 57.1) and no dark flashes in 257 s.
 
 For development on Linux, `scripts/linux/dev-build.sh [--lift] [--install]` rebuilds from the builder's own work folder and
 compiler: a change to `host/` or `gpu/vk/` relinks in about 15 seconds instead of the builder's 40 minutes.
