@@ -14,6 +14,7 @@
 #include <set>
 #include <memory>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 #include <condition_variable>
 #include <deque>
@@ -905,6 +906,36 @@ void memory_drop_shadow(uint64_t guest, uint64_t size) {
     shadow_drop_range(guest, guest + size);
 }
 
+// ---- (tk) Learned write-back. Every writable binding's range was copied back into guest memory at the end of its submission:
+// 67 MB a frame in Link's house, 60 of it one 144 MB pool (the foliage culling's records), across PCIe into the game's memory,
+// 3 ms of GPU time a frame, and on the path of the culling readback the game waits for. The game's CPU reads GPU results only where
+// it invalidates them first (vk_replay.cpp invalidate): those 1 MB regions are written back as before, from their first invalidate
+// on; the others stay in the mirror, which is what the GPU reads. RX_VK_WB_LEARN=0: everything written back, as before ----
+namespace {
+std::mutex cpu_read_mu;
+std::unordered_set<uint64_t> cpu_read_regions;   // (guest >> 20)
+std::atomic<int64_t> st_wb_skipped{0};
+}
+bool wb_learn_on() {
+    static const bool on = !getenv("RX_VK_WB_LEARN") || atoi(getenv("RX_VK_WB_LEARN")) != 0;
+    return on;
+}
+void memory_note_cpu_read(uint64_t guest, uint64_t size) {
+    if (!wb_learn_on() || !size) return;
+    std::lock_guard lk(cpu_read_mu);
+    for (uint64_t r = guest >> 20; r <= (guest + size - 1) >> 20; r++)
+        if (cpu_read_regions.insert(r).second) logf("vk: write-back: the CPU reads GPU results in %#llx+1MB: written back from now on",
+                                                    (unsigned long long)(r << 20));
+}
+namespace {
+bool cpu_reads_in(uint64_t guest_lo, uint64_t guest_hi) {
+    std::lock_guard lk(cpu_read_mu);
+    for (uint64_t r = guest_lo >> 20; r <= (guest_hi - 1) >> 20; r++)
+        if (cpu_read_regions.count(r)) return true;
+    return false;
+}
+}
+
 // ---- (EvilBoyce) GPU results by page: the submission that last wrote a page into guest memory ----
 // For invalidate (vk_replay.cpp): a CPU read of GPU results waits until the submission that writes them there is done, as
 // the console's coherent memory has them once that work is. Guest page number -> the recording's timeline value (write-backs
@@ -1734,8 +1765,26 @@ struct BindMemo {
 };
 thread_local BindMemo bind_memo[256];
 
+bool pass_trace_on();
+void trace_line(const char* fmt, ...);
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (written) texture_gpu_wrote(gpu, size);
+    if (written && pass_trace_on()) {   // (tk, RX_VK_TRACE_BIND=<hex gpu>,...: the writable bindings of those addresses in the pass trace)
+        static const std::vector<uint64_t> want = [] {
+            std::vector<uint64_t> v;
+            for (const char* q = getenv("RX_VK_TRACE_BIND"); q && *q;) {
+                char* end;
+                const uint64_t a = strtoull(q, &end, 16);
+                if (end == q) break;
+                v.push_back(a);
+                q = *end ? end + 1 : end;
+            }
+            return v;
+        }();
+        for (const uint64_t a : want)
+            if (a >= gpu && a < gpu + size) trace_line("bind written %#llx +%#llx (rec value %llu)", (unsigned long long)gpu,
+                                                       (unsigned long long)size, (unsigned long long)mem_rec_value);
+    }
     // (below 1 TB a GPU address is the guest address itself, and a pool holds the whole range or nothing: the host's
     // two translations are for the virtual pools above)
     uint64_t guest = gpu;
@@ -2096,6 +2145,14 @@ void memory_end_submission(VkCommandBuffer cmd) {
                     runs.push_back({w.lo, w.lo, w.hi - w.lo});
             }
             cut_cpu_words(*p, runs);
+            if (wb_learn_on()) {   // (tk) only the regions the CPU reads GPU results in
+                size_t k = 0;
+                for (const VkBufferCopy& r : runs) {
+                    if (cpu_reads_in(p->lo + r.dstOffset, p->lo + r.dstOffset + r.size)) runs[k++] = r;
+                    else st_wb_skipped += (int64_t)r.size;
+                }
+                runs.resize(k);
+            }
             if (runs.empty()) continue;
             checkpoint_mark(cmd, p->lo, 'b');
             vkCmdCopyBuffer(cmd, p->mirror, p->buffer, (uint32_t)runs.size(), runs.data());
