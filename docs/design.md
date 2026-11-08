@@ -259,3 +259,25 @@ dump, the runtime made game-neutral, the stage-1 tools checked on MKW's dump as 
 - The builder's first full build: 43 minutes at below-normal priority, 0 failures; the folder starts from a double click and reaches the title at 60 fps.
 - Render conditions here gate single lights and read reports earlier in the same stream, so they cannot be read at record time.
 
+
+## 12. Findings, 2026-11-08 (fork TimothyKrell/Hookshot, Linux, Ryzen 9 7950X + RTX 5090)
+
+- Readback wait (EvilBoyce, 40c3f85): the game reads its GPU culling results (two 0x3980-byte ping-pong buffers, written by the
+  culling's indirect dispatches after the depth prepass and once more after the 384x216 passes) right after it submits the command
+  buffer that writes them, so the console stalls here too. Here the stall is the GPU's backlog, not the replay (catch-up 0 ms).
+  Off: 5-6 fps more and ~3x the dark one-frame flashes (6 against 1-2 in 100 s in Link's house): kept on.
+- Write-back was the GPU's biggest cost: 67 MB a frame, 60 of it the foliage culling's 144 MB pool that the CPU never reads. Written
+  back only in 1 MB regions the CPU invalidates (vk_memory.cpp, RX_VK_WB_LEARN): 14 MB, GPU 8.4 -> 5.3 ms. Cut to the exact pages
+  invalidated, flashes went from 2 to 8 in 100 s: the game reads GPU results around what it invalidates. The 1 MB regions stay.
+- The game's own shader work is 2.6 ms of the 5.3 ms GPU frame (RX_VK_GPU_PROFILE); the rest is mirror syncs (12-14 MB in ~3,500
+  copies a frame), write-backs and their barriers.
+- A bad dump stalls the CPU: three textures with their first 12 KB zeroed (scripts/check_romfs.py) made the resource loader retry a
+  Fairy Fountain model and texture ~11 times a second (ParallelDecomp and OptimizeChangeBanc at 60-90% of a core).
+- Dark frames, what the probes (RX_VK_PROBE=2) show at one in Link's house: the shadow cascades (512x512) are normal; the first pass
+  that differs is f8c237d19f90b5fb (1536x864 f100, one draw, samples its own target 0x10001201000 and the depth 0x10000000000), whose
+  centre texel is bit-identical in the frames before and different in the dark one, then its 768x432 / 384x216 downsamples, a
+  mask's alpha (d8180bd8c6ecc77b, ffffffff -> 00ffffff), and the lighting (46c14f8ee79c5349 on) adds nothing. Render conditions are
+  not it (the dark frame's are the same as its neighbours'). Next: copy-on-feedback for draws that sample their own colour target
+  (draw_hazards lets those through: undefined in Vulkan), and the depth that pass reads.
+- Measured and not it: blanket dispatch barriers (RX_VK_NO_DISPATCH_ORDER), the parallel replay (RX_VK_PARALLEL=4: slower),
+  RX_VK_CHUNK 40/60, HOS_VCORES=0, HOS_FPS_TARGET, -ftls-model=initial-exec (the back end no longer loads: static TLS).
