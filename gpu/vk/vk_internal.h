@@ -142,6 +142,7 @@ void memory_collect_written();
 void memory_capture_submit();
 /// The replay of the next submit: its capture (false: none, the pages are collected now as before)
 bool memory_take_capture(uint64_t value, uint64_t completed);
+bool memory_capture_now(uint64_t value, uint64_t completed);   // (hookshot: made and taken at once)
 /// The submission the replay records next (bindings note it: a pool's mirror is in use until it is done)
 void memory_recording_value(uint64_t value, uint64_t completed);
 /// RX_VK_TEX_CAPTURE (on with the capture; =0 off): the storage of a texture uploaded from guest memory joins the
@@ -160,6 +161,7 @@ bool create_buffer_cached(uint64_t size, VkBufferUsageFlags usage, VkBuffer& buf
                           void** mapped);   // (vk_vma.cpp: cached host memory, mapped)
 void flush_mapped(VmaAllocation allocation, uint64_t size);
 void memory_stamp_gpu(uint64_t guest, uint64_t size);   // (a GPU write: memory_stamp, and the pages noted)
+void memory_protect_gpu(uint64_t guest, uint64_t size);  // (RX_VK_PROTECT_BARE=1: pages a shader writes through a table pointer)
 /// (vk_replay.cpp) guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
 bool ub_read(uint64_t addr, void* dst, uint64_t n);
 /// [guest, guest + n) as of the submit being replayed: live itself, or scratch holding it with the kept pages over it
@@ -168,12 +170,12 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
-uint64_t memory_writeback_part(uint64_t guest, uint64_t size);   // (tk) the newest part whose write-back reaches into it (0: none)
-void memory_recording_part(uint64_t part);
-void hud_note_present(uint64_t gpu);
+void hud_note_present(uint64_t gpu);   // (tk, vk_draw.cpp: a window texture presented; the HUD squeeze finds its target from it)
 bool pass_trace_on();                      // (vk_draw.cpp: RX_VK_PASS_TRACE)
 void trace_line(const char* fmt, ...);     // (vk_draw.cpp: a line in the pass trace)
-void memory_note_cpu_read(uint64_t guest, uint64_t size);   // (tk, vk_memory.cpp: the CPU reads GPU results there: written back)   // (tk, vk_draw.cpp: a window texture presented; the HUD squeeze finds its target from it)
+void memory_note_cpu_read(uint64_t guest, uint64_t size);   // (tk, vk_memory.cpp: the CPU reads GPU results there: written back)
+void memory_note_readback(uint64_t guest, uint64_t size);   // (PR 430) a CPU read of GPU results: see memory_rb_refresh
+bool memory_rb_refresh(VkCommandBuffer up);
 uint32_t memory_generation();
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
 bool memory_written_since(uint64_t guest, uint64_t size, uint32_t gen);
