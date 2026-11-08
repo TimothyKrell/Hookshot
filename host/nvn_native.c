@@ -309,9 +309,17 @@ NV(nvnMemoryPoolMap) {
 }
 NV(nvnMemoryPoolGetBufferAddress) { RET(((const nvn_pool *)P(0))->gpu); }
 NV(nvnMemoryPoolFlushMappedRange) {}   /* CPU writes are seen through write watch */
+/* (tk) A CPU read of GPU results can wait for the GPU (the back end's readback wait, ~2 ms at times in OoT): the guest thread gives its
+   virtual core up for it, as it does in any of the guest's own waits, so the other game threads run meanwhile */
+static void invalidate_off_core(uint64_t gpu, uint64_t size) {
+    const int away = hos_vcore_away();
+    rx_nvn_invalidate(gpu, size);
+    if (away) hos_vcore_back();
+}
+
 NV(nvnMemoryPoolInvalidateMappedRange) {   /* the CPU is about to read what the GPU wrote */
     const nvn_pool *o = (const nvn_pool *)P(0);
-    if ((int64_t)U64(1) >= 0) rx_nvn_invalidate(o->gpu + U64(1), U64(2));
+    if ((int64_t)U64(1) >= 0) invalidate_off_core(o->gpu + U64(1), U64(2));
 }
 NV(nvnMemoryPoolSetDebugLabel) {}
 /* NVNmappingRequest (0x28 bytes): physical pool (guest pointer), physical offset, virtual offset, size, storage class */
@@ -412,7 +420,7 @@ NV(nvnBufferGetSize) { RET(((const nvn_buffer *)P(0))->size); }
 NV(nvnBufferFlushMappedRange) {}
 NV(nvnBufferInvalidateMappedRange) {
     const nvn_buffer *o = (const nvn_buffer *)P(0);
-    if (o->pool) rx_nvn_invalidate(o->pool->gpu + (uint64_t)o->off + U64(1), U64(2));
+    if (o->pool) invalidate_off_core(o->pool->gpu + (uint64_t)o->off + U64(1), U64(2));
 }
 NV(nvnBufferSetDebugLabel) {}
 
