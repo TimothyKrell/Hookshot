@@ -470,7 +470,8 @@ def main():
         for f in sorted(translator) + [os.path.join(vk, n) for n in ("vk_shader.cpp", "vk_state.h", "vk_api.h")]:
             with open(f, "rb") as src:
                 stamp.update(os.path.relpath(f, vk).replace("\\", "/").encode() + src.read().replace(bytes((13, 10)), bytes((10,))))
-        vflags = vk_target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
+        vflags = vk_target() + CPU + (["-fPIC", "-I" + POSIX, "-D_GNU_SOURCE"] +  # (tk) initial-exec TLS: the game restarts itself with room for it (host/hos_main.c ensure_static_tls); HOOKSHOT_VK_TLS_IE=0: the default model
+                                          (["-ftls-model=initial-exec"] if os.environ.get("HOOKSHOT_VK_TLS_IE", "1") == "1" else []) if LINUX else []) + [   # (hookshot: the replay is the frame's limit now)
             "-DHOOKSHOT_SHADER_STAMP=0x%sull" % stamp.hexdigest()[:16],
             # (what the code takes for granted, which newer C++ libraries bring in by themselves and older ones do not: issue 48)
             "-include", "algorithm", "-include", "cstdio", "-include", "cstdlib", "-include", "cstring", "-include", "functional",

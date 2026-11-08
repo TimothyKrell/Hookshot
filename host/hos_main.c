@@ -558,9 +558,26 @@ static void keep_to_one_ccd(void) {
                 CPU_COUNT(&now), strtok(list, "\n"));
 }
 
+/* (tk) The Vulkan back end is built with -ftls-model=initial-exec (nx2/build.py): its thread_locals are read with no call, where the
+   default model called __tls_get_addr and a TLS wrapper on every access (~6% of the replay thread; the benchmark frame 4.62 -> 3.99
+   ms). Loaded with dlopen, a library's initial-exec TLS (48 KB here) must fit in the static TLS the loader set aside at the
+   start, which glibc keeps small unless told: the game asks for more and starts itself again, once, before anything else */
+static void ensure_static_tls(char **argv) {
+    const char *t = getenv("GLIBC_TUNABLES");
+    if (t && strstr(t, "glibc.rtld.optional_static_tls")) return;
+    char buf[1024];
+    snprintf(buf, sizeof buf, "%s%sglibc.rtld.optional_static_tls=262144", t ? t : "", t && *t ? ":" : "");
+    setenv("GLIBC_TUNABLES", buf, 1);
+    char self[4096];   /* (the binary's own path, not /proc/self/exe: that one would name the process "exe") */
+    const ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
+    if (n > 0) self[n] = 0, execv(self, argv);
+    fprintf(stderr, "[hos host] could not restart with more static TLS: the Vulkan back end may not load\n");
+}
+
 int main(int argc, char **argv) {
     int hos_display_init(void);
     void hos_display_loop(void);
+    ensure_static_tls(argv);
     load_hookshot_env();
     keep_to_one_ccd();
     game_argc = argc, game_argv = argv;
