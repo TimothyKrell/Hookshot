@@ -54,6 +54,7 @@ struct Pool {
     bool inherit_pending = false;
     uint64_t retired_epoch = 0;
 };
+uint64_t mem_rec_part = 0;   // (tk) the part (a recording's command buffer, vk_replay.cpp part_tl) being made
 uint64_t mem_rec_value = 0, mem_completed = 0;   // (the recording being made, and the GPU's progress)
 
 struct GuestPool {
@@ -943,12 +944,17 @@ bool cpu_reads_in(uint64_t guest_lo, uint64_t guest_hi) {
 namespace {
 std::mutex wb_pages_mu;
 std::unordered_map<uint32_t, uint64_t> wb_pages;
+std::unordered_map<uint32_t, uint64_t> wb_parts;   // (tk) page -> the part whose write-back brings it, for the wait on that part alone
 uint64_t wb_pruned_at = 0;
 void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value) {
     static const bool off = getenv("RX_VK_NO_READBACK_WAIT") != nullptr;
     if (off || !value || guest_hi <= guest_lo) return;
     std::lock_guard lk(wb_pages_mu);
-    for (uint64_t p = guest_lo >> kPageShift; p <= (guest_hi - 1) >> kPageShift; p++) wb_pages[(uint32_t)p] = value;
+    for (uint64_t p = guest_lo >> kPageShift; p <= (guest_hi - 1) >> kPageShift; p++) {
+        wb_pages[(uint32_t)p] = value;
+        if (mem_rec_part) wb_parts[(uint32_t)p] = mem_rec_part;
+    }
+    if (wb_parts.size() > 200000) wb_parts.clear();   // (a part long done is waited for at once anyway)
     if (wb_pages.size() > 200000 && mem_completed > wb_pruned_at) {   // (the ones done long ago: kept as "ever" with value 1)
         for (auto& kv : wb_pages)
             if (kv.second <= mem_completed) kv.second = 1;
@@ -956,6 +962,16 @@ void wb_pages_note(uint64_t guest_lo, uint64_t guest_hi, uint64_t value) {
     }
 }
 } // namespace
+uint64_t memory_writeback_part(uint64_t guest, uint64_t size) {
+    uint64_t v = 0;
+    if (!size) return 0;
+    std::lock_guard lk(wb_pages_mu);
+    for (uint64_t p = guest >> kPageShift; p <= (guest + size - 1) >> kPageShift; p++) {
+        auto it = wb_parts.find((uint32_t)p);
+        if (it != wb_parts.end()) v = std::max(v, it->second);
+    }
+    return v;
+}
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever) {
     uint64_t v = 0;
     if (ever) *ever = false;
@@ -1147,6 +1163,7 @@ bool capture_owns(uint64_t guest) {
     };
     return in(cap_ranges) || in(tex_cap_ranges) || in(pool_cap_ranges);
 }
+void memory_recording_part(uint64_t part) { mem_rec_part = part; }
 void memory_recording_value(uint64_t value, uint64_t completed) {
     mem_rec_value = value;
     if (completed > mem_completed) mem_completed = completed;
@@ -1773,8 +1790,6 @@ struct BindMemo {
 };
 thread_local BindMemo bind_memo[256];
 
-bool pass_trace_on();
-void trace_line(const char* fmt, ...);
 BufferRef gpu_buffer_bind(uint64_t gpu, uint64_t size, bool written) {
     if (written) texture_gpu_wrote(gpu, size);
     if (written && pass_trace_on()) {   // (tk, RX_VK_TRACE_BIND=<hex gpu>,...: the writable bindings of those addresses in the pass trace)

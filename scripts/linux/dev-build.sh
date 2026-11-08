@@ -46,6 +46,13 @@ if [ $lift = 1 ]; then
 fi
 "$PY" -I -u nx2/build.py --standalone --jobs "$JOBS"
 echo "built in $(( $(date +%s) - t0 )) s"
+# (a declaration that landed in an anonymous namespace leaves the back end with a symbol nothing defines: it then fails to load and the
+# game runs with nothing drawn, at a perfect 60 fps. Caught here instead)
+if [ -f "$WORK/sa/build/hookshot_vk.so" ] && nm -D --undefined-only "$WORK/sa/build/hookshot_vk.so" | grep -q '_GLOBAL__N_'; then
+    echo "hookshot_vk.so has undefined anonymous-namespace symbols (it would not load):"
+    nm -D --undefined-only "$WORK/sa/build/hookshot_vk.so" | grep '_GLOBAL__N_' | c++filt
+    exit 1
+fi
 
 if [ $install = 1 ]; then
     for f in hookshot hookshot_vk.so; do

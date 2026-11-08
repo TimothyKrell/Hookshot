@@ -48,6 +48,14 @@ namespace {
 
 // ---- submissions: a timeline semaphore; value n = the n-th submit done ----
 VkSemaphore timeline = VK_NULL_HANDLE;
+// (tk) part_tl: every recording's command buffer signals its own serial when done (the parts of a submission too, which the timeline
+// above is not signalled for until its last part). A readback waits for the part whose write-back brings what it reads, not for the
+// whole submission: OoT's culling results are written back about 60% into the frame's one big submission. Off by default
+// (RX_VK_READBACK_PART=1: on): ~2-3 fps more, but the dark one-frame flashes come back (9 -> 18 in 250 s in Link's house): what the
+// game reads after its submit is written later in it too
+VkSemaphore part_tl = VK_NULL_HANDLE;
+uint64_t part_next = 0;
+std::atomic<uint64_t> part_submitted{0};   // (the newest part handed to vkQueueSubmit2: a wait on a later one could wait on the replay)
 std::atomic<uint64_t> pushed{0};
 std::atomic<uint64_t> q_values{0};   // the fence values handed out (a submit or a present takes one each)
 std::mutex replay_mu;   // one replay at a time (the game submits from several threads)
@@ -73,6 +81,7 @@ struct Recording {
     VkFence fence = VK_NULL_HANDLE;
     bool submitted = false;
     uint64_t batch = 0;   // (RX_VK_BATCH: the batch it went out in, waited for on batch_tl; 0: its own fence)
+    uint64_t part = 0;    // (tk) its serial on part_tl
 };
 // (24: the event waits cut a frame's command buffers into pieces, each with recordings of its own, and with 16 the
 // replay waited ~1.5 ms a frame for a slot the GPU still had)
@@ -241,12 +250,15 @@ Recording& begin_recording(uint64_t value) {
     gpu_time_begin(r);
     gprof_begin_recording(r.slot, r.cmd);
     r.value = value;
+    r.part = ++part_next;
+    memory_recording_part(part_tl ? r.part : 0);
     memory_recording_value(value, completed());
     texture_begin_recording(r.upload, value);
     draw_begin_recording(r.slot, r.cmd, value);
     return r;
 }
 void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at = 0) {
+    if (pass_trace_on()) trace_line("submit recording %llu%s", (unsigned long long)r.value, signal_value ? " (signals)" : " (a part)");
     const bool uploads = texture_uploads_recorded();
     gpu_time_end(r);
     vkEndCommandBuffer(r.upload);
@@ -262,8 +274,15 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     si.commandBufferInfoCount = n;
     si.pCommandBufferInfos = cb;
-    si.signalSemaphoreInfoCount = signal_value ? 1 : 0;
-    si.pSignalSemaphoreInfos = signal_value ? &signal : nullptr;
+    VkSemaphoreSubmitInfo signals[2] = {signal, {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO}};
+    uint32_t nsig = signal_value ? 1 : 0;
+    if (part_tl && !batch_on()) {   // (tk) this part's serial
+        signals[nsig] = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+        signals[nsig].semaphore = part_tl, signals[nsig].value = r.part, signals[nsig].stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+        nsig++;
+    }
+    si.signalSemaphoreInfoCount = nsig;
+    si.pSignalSemaphoreInfos = nsig ? signals : nullptr;
     std::lock_guard lk(dev.present_mu);   // (one queue: submits and presents take turns)
     if (batch_on()) {
         if (pend.cbs.empty()) batch_next++, pend_since = std::chrono::steady_clock::now();
@@ -279,6 +298,7 @@ void submit_recording(Recording& r, bool signal_value = true, uint64_t signal_at
     PROF(PROF_QSUBMIT);
     const VkResult res = vkQueueSubmit2(dev.queue, 1, &si, r.fence);
     r.submitted = res == VK_SUCCESS;
+    if (r.submitted && part_tl) part_submitted.store(r.part, std::memory_order_release);
     static int failures;
     if (res != VK_SUCCESS && failures++ < 8) logf("vk: submit %llu failed (%d)", (unsigned long long)r.value, (int)res);
     if (res == VK_ERROR_DEVICE_LOST) checkpoints_report();
@@ -1935,8 +1955,19 @@ void invalidate(uint64_t gpu, uint64_t size) {
             static const bool no_catchup = getenv("RX_VK_READBACK_NO_CATCHUP") != nullptr;   // (A/B: recorded work only)
             if (behind0 && !no_catchup) wait_queue_empty(), w = true;   // (work handed over may write it back too)
             const auto w1 = std::chrono::steady_clock::now();
-            const uint64_t v = memory_writeback_value(host->gpu_guest(gpu), size, nullptr);
-            if (v > completed()) wait_value(v), w = true;
+            const uint64_t rlo_g = host->gpu_guest(gpu), rhi_g = rlo_g + size;
+            const uint64_t v = memory_writeback_value(rlo_g, size, nullptr);
+            const uint64_t part = part_tl ? memory_writeback_part(rlo_g, rhi_g - rlo_g) : 0;
+            uint64_t part_done = 0;
+            if (part) vkGetSemaphoreCounterValue(dev.device, part_tl, &part_done);
+            if (part && part <= part_submitted.load(std::memory_order_acquire)) {   // (tk) the part that writes it back: submitted, waited for
+                if (part > part_done) {
+                    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+                    wi.semaphoreCount = 1, wi.pSemaphores = &part_tl, wi.pValues = &part;
+                    vkWaitSemaphores(dev.device, &wi, UINT64_MAX);
+                    w = true;
+                }
+            } else if (v > completed()) wait_value(v), w = true;
             if (w) {
                 waited++;
                 const int64_t d = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - w0).count();
@@ -3230,6 +3261,10 @@ bool replay_start() {
     tsi.pNext = &ti;
     if (vkCreateSemaphore(dev.device, &tsi, nullptr, &timeline) != VK_SUCCESS) return false;
     if (vkCreateSemaphore(dev.device, &tsi, nullptr, &batch_tl) != VK_SUCCESS) batch_tl = VK_NULL_HANDLE;
+    {
+        static const bool part_wait = getenv("RX_VK_READBACK_PART") && atoi(getenv("RX_VK_READBACK_PART")) != 0;
+        if (part_wait && vkCreateSemaphore(dev.device, &tsi, nullptr, &part_tl) != VK_SUCCESS) part_tl = VK_NULL_HANDLE;
+    }
     VkCommandPoolCreateInfo pi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pi.queueFamilyIndex = dev.queue_family;
     pi.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;

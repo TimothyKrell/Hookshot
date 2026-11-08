@@ -3,6 +3,7 @@
    format for llvm-profdata.
    HOS_PGO=<path>: every 500 ms, if <path>.reset exists the counters are cleared, and if <path>.dump exists they are written to <path>;
    each file is deleted when done. So a run can leave out the loading. */
+#ifdef _WIN32
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,3 +88,43 @@ __attribute__((constructor)) static void pgo_start(void) {
     const char *e = getenv("HOS_PGO");
     if (e) CreateThread(NULL, 0, pgo_thread, _strdup(e), 0, NULL);
 }
+#else
+/* (tk, linux) clang's own profile runtime (libclang_rt.profile, which this toolchain has on Linux) keeps and writes the counters; this
+   keeps the same HOS_PGO=<path> interface: <path>.reset clears them, <path>.dump writes the raw profile to <path>. A test run ends
+   with SIGKILL, so the runtime's own write at exit is not counted on. */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+
+int __llvm_profile_write_file(void);
+void __llvm_profile_reset_counters(void);
+void __llvm_profile_set_filename(const char *name);
+
+static void *pgo_thread(void *arg) {
+    const char *path = arg;
+    char dump[4096], reset[4096];
+    snprintf(dump, sizeof dump, "%s.dump", path);
+    snprintf(reset, sizeof reset, "%s.reset", path);
+    __llvm_profile_set_filename(path);
+    for (;;) {
+        usleep(500000);
+        if (access(reset, F_OK) == 0) {
+            __llvm_profile_reset_counters();
+            unlink(reset);
+        }
+        if (access(dump, F_OK) == 0) {
+            __llvm_profile_write_file();
+            unlink(dump);
+        }
+    }
+    return NULL;
+}
+
+__attribute__((constructor)) static void pgo_start(void) {
+    const char *e = getenv("HOS_PGO");
+    pthread_t t;
+    if (e) pthread_create(&t, NULL, pgo_thread, strdup(e));
+}
+#endif

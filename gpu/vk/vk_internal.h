@@ -168,7 +168,11 @@ void memory_drop_shadow(uint64_t guest, uint64_t size);   // (a write the captur
 /// (EvilBoyce) the newest submission value whose write-back reaches into [guest, guest + size) (0: none ever); *ever set
 /// when any write-back ever did
 uint64_t memory_writeback_value(uint64_t guest, uint64_t size, bool* ever);
+uint64_t memory_writeback_part(uint64_t guest, uint64_t size);   // (tk) the newest part whose write-back reaches into it (0: none)
+void memory_recording_part(uint64_t part);
 void hud_note_present(uint64_t gpu);
+bool pass_trace_on();                      // (vk_draw.cpp: RX_VK_PASS_TRACE)
+void trace_line(const char* fmt, ...);     // (vk_draw.cpp: a line in the pass trace)
 void memory_note_cpu_read(uint64_t guest, uint64_t size);   // (tk, vk_memory.cpp: the CPU reads GPU results there: written back)   // (tk, vk_draw.cpp: a window texture presented; the HUD squeeze finds its target from it)
 uint32_t memory_generation();
 /// 1: a page of [guest, guest + size) was written after generation gen; 0: none was
